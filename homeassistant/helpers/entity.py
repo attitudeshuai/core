@@ -1298,6 +1298,7 @@ class Entity(
             self._context_set = None
 
         # Intentionally called with positional args for performance reasons
+        platform = self.platform
         self.hass.states.async_set_internal(
             self.entity_id,
             state,
@@ -1306,6 +1307,7 @@ class Entity(
             self._context,
             self._state_info,
             time_now,
+            platform.platform_name if platform is not None else None,
         )
 
     def schedule_update_ha_state(self, force_refresh: bool = False) -> None:

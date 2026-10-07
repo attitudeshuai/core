@@ -2199,10 +2199,30 @@ class States(UserDict[str, State]):
         return self._domain_index[key].values()
 
 
+# State write categories passed to the state machine write observer.
+STATE_WRITE_CHANGED: Final = 0
+# The state value changed, or the state was written for the first time.
+STATE_WRITE_ATTRIBUTES: Final = 1
+# The state value did not change but the attributes did.
+STATE_WRITE_REPORTED: Final = 2
+# Neither the state value nor the attributes changed (duplicate report).
+STATE_WRITE_REMOVED: Final = 3
+# The state was removed; this is a lifecycle event rather than a write.
+
+type StateWriteObserver = Callable[[str, int, str | None, float], None]
+
+
 class StateMachine:
     """Helper class that tracks the state of different entities."""
 
-    __slots__ = ("_bus", "_loop", "_reservations", "_states", "_states_data")
+    __slots__ = (
+        "_bus",
+        "_loop",
+        "_reservations",
+        "_states",
+        "_states_data",
+        "_write_observer",
+    )
 
     def __init__(self, bus: EventBus, loop: asyncio.events.AbstractEventLoop) -> None:
         """Initialize state machine."""
@@ -2213,6 +2233,7 @@ class StateMachine:
         self._reservations: set[str] = set()
         self._bus = bus
         self._loop = loop
+        self._write_observer: StateWriteObserver | None = None
 
     def entity_ids(self, domain_filter: str | None = None) -> list[str]:
         """List of entity ids that are being tracked."""
@@ -2335,6 +2356,8 @@ class StateMachine:
             state_changed_data,
             context=context,
         )
+        if self._write_observer is not None:
+            self._write_observer(entity_id, STATE_WRITE_REMOVED, None, time.time())
         return True
 
     def set(
@@ -2344,6 +2367,7 @@ class StateMachine:
         attributes: Mapping[str, Any] | None = None,
         force_update: bool = False,
         context: Context | None = None,
+        writer: str | None = None,
     ) -> None:
         """Set the state of an entity, add entity if it does not exist.
 
@@ -2354,13 +2378,29 @@ class StateMachine:
         """
         run_callback_threadsafe(
             self._loop,
-            self.async_set,
-            entity_id,
-            new_state,
-            attributes,
-            force_update,
-            context,
+            functools.partial(
+                self.async_set,
+                entity_id,
+                new_state,
+                attributes=attributes,
+                force_update=force_update,
+                context=context,
+                writer=writer,
+            ),
         ).result()
+
+    @callback
+    def async_set_write_observer(self, observer: StateWriteObserver | None) -> None:
+        """Register an observer called for every state write.
+
+        The observer is called with the entity id, a STATE_WRITE_* category,
+        an optional writer identifier and the write timestamp. Pass None to
+        remove the observer. When no observer is registered, state writes
+        perform no extra work.
+
+        This method must be run in the event loop.
+        """
+        self._write_observer = observer
 
     @callback
     def async_reserve(self, entity_id: str) -> None:
@@ -2397,6 +2437,7 @@ class StateMachine:
         context: Context | None = None,
         state_info: StateInfo | None = None,
         timestamp: float | None = None,
+        writer: str | None = None,
     ) -> None:
         """Set the state of an entity, add entity if it does not exist.
 
@@ -2404,6 +2445,9 @@ class StateMachine:
 
         If you just update the attributes and not the state, last changed will
         not be affected.
+
+        Writer is an optional identifier of the integration performing the
+        write, used by the state write observer when one is registered.
 
         This method must be run in the event loop.
         """
@@ -2417,6 +2461,7 @@ class StateMachine:
             context,
             state_info,
             timestamp or time.time(),
+            writer,
         )
 
     @callback
@@ -2429,6 +2474,7 @@ class StateMachine:
         context: Context | None,
         state_info: StateInfo | None,
         timestamp: float,
+        writer: str | None = None,
     ) -> None:
         """Set the state of an entity, add entity if it does not exist.
 
@@ -2491,6 +2537,8 @@ class StateMachine:
                 context=context,
                 time_fired=timestamp,
             )
+            if self._write_observer is not None:
+                self._write_observer(entity_id, STATE_WRITE_REPORTED, writer, timestamp)
             return
 
         if same_attr:
@@ -2536,6 +2584,13 @@ class StateMachine:
             context=context,
             time_fired=timestamp,
         )
+        if self._write_observer is not None:
+            self._write_observer(
+                entity_id,
+                STATE_WRITE_ATTRIBUTES if same_state else STATE_WRITE_CHANGED,
+                writer,
+                timestamp,
+            )
 
 
 class SupportsResponse(enum.StrEnum):
