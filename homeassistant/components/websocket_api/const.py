@@ -39,6 +39,7 @@ ERR_NOT_FOUND: Final = "not_found"
 ERR_NOT_SUPPORTED: Final = "not_supported"
 ERR_HOME_ASSISTANT_ERROR: Final = "home_assistant_error"
 ERR_SERVICE_VALIDATION_ERROR: Final = "service_validation_error"
+ERR_SUBSCRIPTION_QUOTA_EXCEEDED: Final = "subscription_quota_exceeded"
 ERR_UNKNOWN_COMMAND: Final = "unknown_command"
 ERR_UNKNOWN_ERROR: Final = "unknown_error"
 ERR_UNAUTHORIZED: Final = "unauthorized"
@@ -54,5 +55,19 @@ SIGNAL_WEBSOCKET_DISCONNECTED: Final = "websocket_disconnected"
 
 # Data used to store the current connection list
 DATA_CONNECTIONS: Final = f"{DOMAIN}.connections"
+
+# Data used to store the subscription governance manager
+DATA_SUBSCRIPTION_GOVERNANCE: Final = f"{DOMAIN}.subscription_governance"
+
+# Subscription governance configuration
+CONF_SUBSCRIPTION_GOVERNANCE: Final = "subscription_governance"
+CONF_MAX_PER_CONNECTION: Final = "max_per_connection"
+CONF_MAX_SYSTEM: Final = "max_system"
+CONF_SLOW_CLIENT: Final = "slow_client"
+CONF_THRESHOLD: Final = "threshold"
+CONF_ACTION: Final = "action"
+
+SLOW_CLIENT_ACTION_MERGE: Final = "merge"
+SLOW_CLIENT_ACTION_DROP: Final = "drop"
 
 FEATURE_COALESCE_MESSAGES = "coalesce_messages"

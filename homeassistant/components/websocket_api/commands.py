@@ -136,6 +136,7 @@ def async_register_commands(
     async_reg(hass, handle_subscribe_system_state)
     async_reg(hass, handle_subscribe_trigger)
     async_reg(hass, handle_subscribe_trigger_platforms)
+    async_reg(hass, handle_subscription_governance_info)
     async_reg(hass, handle_test_condition)
     async_reg(hass, handle_unsubscribe_events)
     async_reg(hass, handle_validate_config)
@@ -292,6 +293,26 @@ def handle_unsubscribe_events(
         connection.send_result(msg["id"])
     else:
         connection.send_error(msg["id"], const.ERR_NOT_FOUND, "Subscription not found.")
+
+
+@callback
+@decorators.require_admin
+@decorators.websocket_command({"type": "subscription_governance/info"})
+def handle_subscription_governance_info(
+    hass: HomeAssistant, connection: ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Report subscription quotas, per-subscription stats and rejections."""
+    governance = hass.data.get(const.DATA_SUBSCRIPTION_GOVERNANCE)
+    if governance is None:
+        connection.send_result(
+            msg["id"],
+            {
+                "enabled": False,
+                "active_connections": hass.data.get(const.DATA_CONNECTIONS, 0),
+            },
+        )
+        return
+    connection.send_result(msg["id"], governance.async_snapshot())
 
 
 @decorators.websocket_command(

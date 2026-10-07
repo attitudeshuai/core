@@ -23,15 +23,24 @@ from homeassistant.util.json import json_loads
 from .auth import AUTH_REQUIRED_MESSAGE, AuthPhase
 from .const import (
     DATA_CONNECTIONS,
+    DATA_SUBSCRIPTION_GOVERNANCE,
     MAX_PENDING_MSG,
     PENDING_MSG_MAX_FORCE_READY,
     PENDING_MSG_PEAK,
     PENDING_MSG_PEAK_TIME,
     SIGNAL_WEBSOCKET_CONNECTED,
     SIGNAL_WEBSOCKET_DISCONNECTED,
+    SLOW_CLIENT_ACTION_DROP,
+    SLOW_CLIENT_ACTION_MERGE,
     URL,
 )
 from .error import Disconnect
+from .governance import (
+    ConnectionGovernor,
+    QueuedSubscriptionMessage,
+    SubscriptionGovernance,
+    async_classify_event_message,
+)
 from .messages import message_to_json_bytes
 from .util import describe_request
 
@@ -43,6 +52,13 @@ AUTH_MESSAGE_TIMEOUT = 10  # seconds
 
 
 _WS_LOGGER: Final = logging.getLogger(f"{__name__}.connection")
+
+
+def _queued_payload(item: bytes | QueuedSubscriptionMessage) -> bytes:
+    """Return the raw bytes of a queued item."""
+    if isinstance(item, QueuedSubscriptionMessage):
+        return item.payload
+    return item
 
 
 class WebsocketAPIView(HomeAssistantView):
@@ -75,6 +91,7 @@ class WebSocketHandler:
         "_closing",
         "_connection",
         "_debug",
+        "_governor",
         "_handle_task",
         "_hass",
         "_logger",
@@ -103,12 +120,13 @@ class WebSocketHandler:
         self._logger = WebSocketAdapter(_WS_LOGGER, {"connid": id(self)})
         self._peak_checker_unsub: Callable[[], None] | None = None
         self._connection: ActiveConnection | None = None
+        self._governor: ConnectionGovernor | None = None
 
         # The WebSocketHandler has a single consumer and path
         # to where messages are queued. This allows the implementation
         # to use a deque and an asyncio.Future to avoid the overhead of
         # an asyncio.Queue.
-        self._message_queue: deque[bytes] = deque()
+        self._message_queue: deque[bytes | QueuedSubscriptionMessage] = deque()
         self._ready_future: asyncio.Future[int] | None = None
         self._release_ready_queue_size: int = 0
         self._async_logging_changed()
@@ -150,6 +168,7 @@ class WebSocketHandler:
         loop = self._loop
         debug = logger.debug
         can_coalesce = connection.can_coalesce
+        governor = connection.governor
         ready_message_count = len(message_queue)
         # Exceptions if Socket disconnected or cancelled by connection handler
         try:
@@ -166,13 +185,25 @@ class WebSocketHandler:
                     can_coalesce = connection.can_coalesce
 
                 if not can_coalesce or ready_message_count == 1:
-                    message = message_queue.popleft()
+                    queued = message_queue.popleft()
+                    if governor is not None:
+                        governor.async_message_popped(queued)
+                    message = _queued_payload(queued)
                     if self._debug:
                         debug("%s: Sending %s", self.description, message)
                     await send_bytes_text(message)
                     continue
 
-                coalesced_messages = b"".join((b"[", b",".join(message_queue), b"]"))
+                if governor is not None:
+                    for queued in message_queue:
+                        governor.async_message_popped(queued)
+                coalesced_messages = b"".join(
+                    (
+                        b"[",
+                        b",".join(_queued_payload(queued) for queued in message_queue),
+                        b"]",
+                    )
+                )
                 message_queue.clear()
                 if self._debug:
                     debug("%s: Sending %s", self.description, coalesced_messages)
@@ -194,28 +225,30 @@ class WebSocketHandler:
             self._peak_checker_unsub()
             self._peak_checker_unsub = None
 
+    @staticmethod
+    def _message_to_bytes(message: str | bytes | dict[str, Any]) -> bytes:
+        """Serialize a message to bytes for the send queue."""
+        if type(message) is not bytes:
+            if isinstance(message, dict):
+                return message_to_json_bytes(message)
+            if isinstance(message, str):
+                return message.encode("utf-8")
+        return message
+
     @callback
-    def _send_message(self, message: str | bytes | dict[str, Any]) -> None:
-        """Queue sending a message to the client.
+    def _async_enqueue(self, item: bytes | QueuedSubscriptionMessage) -> None:
+        """Add an already serialized item to the send queue.
 
         Closes connection if the client is not reading the messages.
 
         Async friendly.
         """
-        if self._closing:
-            # Connection is cancelled, don't flood logs about exceeding
-            # max pending messages.
-            return
-
-        if type(message) is not bytes:
-            if isinstance(message, dict):
-                message = message_to_json_bytes(message)
-            elif isinstance(message, str):
-                message = message.encode("utf-8")
-
         message_queue = self._message_queue
-        message_queue.append(message)
+        message_queue.append(item)
         if (queue_size_after_add := len(message_queue)) >= MAX_PENDING_MSG:
+            last_message = (
+                item.payload if isinstance(item, QueuedSubscriptionMessage) else item
+            )
             self._logger.error(
                 (
                     "%s: Client unable to keep up with"
@@ -225,7 +258,7 @@ class WebSocketHandler:
                 ),
                 self.description,
                 MAX_PENDING_MSG,
-                message,
+                last_message,
             )
             self._cancel()
             return
@@ -246,6 +279,69 @@ class WebSocketHandler:
             self._peak_checker_unsub = async_call_later(
                 self._hass, PENDING_MSG_PEAK_TIME, self._check_write_peak
             )
+
+    @callback
+    def _send_message(self, message: str | bytes | dict[str, Any]) -> None:
+        """Queue sending a message to the client.
+
+        Closes connection if the client is not reading the messages.
+
+        Async friendly.
+        """
+        if self._closing:
+            # Connection is cancelled, don't flood logs about exceeding
+            # max pending messages.
+            return
+
+        self._async_enqueue(self._message_to_bytes(message))
+
+    @callback
+    def _async_governed_send_message(
+        self, message: str | bytes | dict[str, Any]
+    ) -> None:
+        """Queue a message with per-subscription slow-client handling.
+
+        Messages that cannot be attributed to a subscription are queued
+        unchanged. When a subscription has more messages pending than the
+        configured threshold, state change messages are merged towards the
+        latest state or excess messages are dropped according to config.
+        """
+        if self._closing:
+            # Connection is cancelled, don't flood logs about exceeding
+            # max pending messages.
+            return
+
+        raw = self._message_to_bytes(message)
+        governor = self._governor
+        subscription_id, is_state_change = async_classify_event_message(message, raw)
+        if governor is None or subscription_id is None:
+            self._async_enqueue(raw)
+            return
+
+        governor.async_message_produced(subscription_id)
+        pending = governor.pending.get(subscription_id, 0)
+        if (
+            threshold := governor.governance.slow_client_threshold
+        ) and pending >= threshold:
+            action = governor.governance.slow_client_action
+            if action == SLOW_CLIENT_ACTION_DROP:
+                governor.async_message_dropped(subscription_id)
+                return
+            if action == SLOW_CLIENT_ACTION_MERGE and is_state_change:
+                holder = governor.coalescing.get(subscription_id)
+                if holder is not None:
+                    holder.payload = raw
+                    governor.async_message_merged(subscription_id)
+                    return
+                holder = QueuedSubscriptionMessage(raw, subscription_id)
+                governor.coalescing[subscription_id] = holder
+                governor.async_message_enqueued(subscription_id)
+                self._async_enqueue(holder)
+                return
+
+        item = QueuedSubscriptionMessage(raw, subscription_id)
+        governor.async_message_enqueued(subscription_id)
+        self._async_enqueue(item)
 
     @callback
     def _release_ready_future_or_reschedule(self) -> None:
@@ -281,6 +377,12 @@ class WebSocketHandler:
         if len(self._message_queue) < PENDING_MSG_PEAK:
             return
 
+        last_item = self._message_queue[-1]
+        last_message = (
+            last_item.payload
+            if isinstance(last_item, QueuedSubscriptionMessage)
+            else last_item
+        )
         self._logger.error(
             (
                 "%s: Client unable to keep up with"
@@ -291,7 +393,7 @@ class WebSocketHandler:
             self.description,
             PENDING_MSG_PEAK,
             PENDING_MSG_PEAK_TIME,
-            self._message_queue[-1],
+            last_message,
         )
         self._cancel()
 
@@ -437,6 +539,15 @@ class WebSocketHandler:
         # We only start the writer queue after the auth phase is completed
         # since there is no need to queue messages before the auth phase
         self._connection = connection
+        governance: SubscriptionGovernance | None = self._hass.data.get(
+            DATA_SUBSCRIPTION_GOVERNANCE
+        )
+        if governance is not None:
+            # Install the governed send path before the writer starts and
+            # before any client subscription can be created.
+            self._governor = governance.async_register_connection(connection)
+            connection.governor = self._governor
+            connection.send_message = self._async_governed_send_message
         self._writer_task = create_eager_task(self._writer(connection, send_bytes_text))
         self._hass.data[DATA_CONNECTIONS] = self._hass.data.get(DATA_CONNECTIONS, 0) + 1
         async_dispatcher_send(self._hass, SIGNAL_WEBSOCKET_CONNECTED)
@@ -573,6 +684,7 @@ class WebSocketHandler:
                 if connection is not None:
                     hass.data[DATA_CONNECTIONS] -= 1
                     self._connection = None
+                    self._governor = None
 
                 async_dispatcher_send(hass, SIGNAL_WEBSOCKET_DISCONNECTED)
 

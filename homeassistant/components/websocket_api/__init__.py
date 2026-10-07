@@ -2,11 +2,20 @@
 
 from typing import Final, cast
 
+import probatio
+
 from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.typing import ConfigType, VolSchemaType
 
-from . import commands, connection, const, decorators, http, messages  # noqa: F401
+from . import (  # noqa: F401
+    commands,
+    connection,
+    const,
+    decorators,
+    governance,
+    http,
+    messages,
+)
 from .connection import ActiveConnection, current_connection  # noqa: F401
 from .const import (  # noqa: F401
     ERR_HOME_ASSISTANT_ERROR,
@@ -41,7 +50,45 @@ DOMAIN: Final = const.DOMAIN
 
 DEPENDENCIES: Final[tuple[str]] = ("http",)
 
-CONFIG_SCHEMA = cv.empty_config_schema(DOMAIN)
+# 0 means the quota dimension is disabled. Negative limits are rejected.
+_SUBSCRIPTION_QUOTA = probatio.All(probatio.Coerce(int), probatio.Range(min=0))
+
+_SLOW_CLIENT_SCHEMA: Final = probatio.Schema(
+    {
+        probatio.Required(const.CONF_THRESHOLD): probatio.All(
+            probatio.Coerce(int), probatio.Range(min=1)
+        ),
+        probatio.Required(const.CONF_ACTION): probatio.In(
+            [
+                const.SLOW_CLIENT_ACTION_MERGE,
+                const.SLOW_CLIENT_ACTION_DROP,
+            ]
+        ),
+    }
+)
+
+_SUBSCRIPTION_GOVERNANCE_SCHEMA: Final = probatio.Schema(
+    {
+        probatio.Optional(
+            const.CONF_MAX_PER_CONNECTION, default=0
+        ): _SUBSCRIPTION_QUOTA,
+        probatio.Optional(const.CONF_MAX_SYSTEM, default=0): _SUBSCRIPTION_QUOTA,
+        probatio.Optional(const.CONF_SLOW_CLIENT): _SLOW_CLIENT_SCHEMA,
+    }
+)
+
+CONFIG_SCHEMA: Final = probatio.Schema(
+    {
+        probatio.Optional(DOMAIN, default={}): probatio.Schema(
+            {
+                probatio.Optional(const.CONF_SUBSCRIPTION_GOVERNANCE): (
+                    _SUBSCRIPTION_GOVERNANCE_SCHEMA
+                )
+            }
+        )
+    },
+    extra=probatio.ALLOW_EXTRA,
+)
 
 
 @callback
@@ -67,4 +114,26 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Initialize the websocket API."""
     hass.http.register_view(http.WebsocketAPIView())
     commands.async_register_commands(hass, async_register_command)
+
+    if governance_config := (config.get(DOMAIN) or {}).get(
+        const.CONF_SUBSCRIPTION_GOVERNANCE
+    ):
+        slow_client_config = governance_config.get(const.CONF_SLOW_CLIENT)
+        hass.data[const.DATA_SUBSCRIPTION_GOVERNANCE] = (
+            governance.SubscriptionGovernance(
+                max_per_connection=governance_config[const.CONF_MAX_PER_CONNECTION],
+                max_system=governance_config[const.CONF_MAX_SYSTEM],
+                slow_client_threshold=(
+                    slow_client_config[const.CONF_THRESHOLD]
+                    if slow_client_config
+                    else 0
+                ),
+                slow_client_action=(
+                    slow_client_config[const.CONF_ACTION]
+                    if slow_client_config
+                    else None
+                ),
+            )
+        )
+
     return True

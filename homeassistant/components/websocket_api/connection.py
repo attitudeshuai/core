@@ -16,6 +16,11 @@ from homeassistant.helpers.redact import async_redact_data
 from homeassistant.util.json import JsonValueType
 
 from . import const, messages
+from .governance import (
+    ConnectionGovernor,
+    SubscriptionGovernance,
+    SubscriptionQuotaExceeded,
+)
 from .messages import (
     error_message,
     event_message,
@@ -26,6 +31,100 @@ from .util import describe_request
 
 if TYPE_CHECKING:
     from .http import WebSocketAdapter
+
+
+_MISSING = object()
+
+
+class SubscriptionDict(dict[Hashable, Callable[[], Any]]):
+    """Subscription dictionary that enforces subscription quotas.
+
+    Client subscriptions are keyed by their increasing command id. Other
+    entries, such as the token revocation callback registered during auth,
+    are not counted against the quota.
+    """
+
+    __slots__ = ("_connection",)
+
+    def __init__(self, connection: ActiveConnection) -> None:
+        """Initialize the subscription dictionary."""
+        super().__init__()
+        self._connection = connection
+
+    def _release_slot(self, key: Hashable) -> None:
+        """Release the quota slot held by a subscription."""
+        connection = self._connection
+        if (
+            type(key) is int
+            and (governance := connection.governance) is not None
+            and (governor := connection.governor) is not None
+        ):
+            governance.async_release_subscription(governor)
+
+    @override
+    def __setitem__(self, key: Hashable, unsub: Callable[[], Any]) -> None:
+        """Add a subscription, rejecting it when a quota is exhausted."""
+        connection = self._connection
+        if (
+            type(key) is int
+            and key not in self
+            and (governance := connection.governance) is not None
+            and (governor := connection.governor) is not None
+        ):
+            try:
+                governance.async_acquire_subscription(governor)
+            except SubscriptionQuotaExceeded:
+                # The handler typically registers its listener as the right
+                # hand side of this assignment, so roll that registration
+                # back to avoid an orphaned listener.
+                try:
+                    unsub()
+                except Exception:
+                    connection.logger.exception(
+                        "Error while rolling back rejected subscription %s", key
+                    )
+                raise
+        super().__setitem__(key, unsub)
+
+    @override
+    def __delitem__(self, key: Hashable) -> None:
+        """Remove a subscription and release its quota slot."""
+        existed = key in self
+        super().__delitem__(key)
+        if existed:
+            self._release_slot(key)
+
+    @override
+    def pop(self, key: Hashable, default: Any = _MISSING) -> Any:
+        """Remove a subscription and return its unsubscribe callback."""
+        if key in self:
+            value = self[key]
+            del self[key]
+            return value
+        if default is _MISSING:
+            raise KeyError(key)
+        return default
+
+    @override
+    def popitem(self) -> tuple[Hashable, Callable[[], Any]]:
+        """Remove and release a subscription."""
+        key, value = super().popitem()
+        self._release_slot(key)
+        return key, value
+
+    @override
+    def clear(self) -> None:
+        """Remove all subscriptions and release their quota slots."""
+        connection = self._connection
+        governor = connection.governor
+        governance = connection.governance
+        if governor is None or governance is None:
+            super().clear()
+            return
+        counted = sum(1 for key in self if type(key) is int)
+        super().clear()
+        if counted:
+            governance.async_release_all(governor, counted)
 
 
 current_connection = ContextVar["ActiveConnection | None"](
@@ -51,6 +150,8 @@ class ActiveConnection:
     __slots__ = (
         "binary_handlers",
         "can_coalesce",
+        "governance",
+        "governor",
         "handlers",
         "hass",
         "last_id",
@@ -79,7 +180,13 @@ class ActiveConnection:
         self.user = user
         self.refresh_token_id = refresh_token.id if refresh_token else None
         self.remote = remote
-        self.subscriptions: dict[Hashable, Callable[[], Any]] = {}
+        self.governance: SubscriptionGovernance | None = hass.data.get(
+            const.DATA_SUBSCRIPTION_GOVERNANCE
+        )
+        self.governor: ConnectionGovernor | None = None
+        self.subscriptions: dict[Hashable, Callable[[], Any]] = (
+            SubscriptionDict(self) if self.governance is not None else {}
+        )
         self.last_id = 0
         self.can_coalesce = False
         self.supported_features: dict[str, float] = {}
@@ -266,6 +373,11 @@ class ActiveConnection:
                     "Error unsubscribing from subscription: %s", unsub
                 )
         self.subscriptions.clear()
+        governor = self.governor
+        governance = self.governance
+        if governor is not None and governance is not None:
+            governance.async_unregister_connection(governor)
+            self.governor = None
         self.send_message = self._connect_closed_error
         current_request.set(None)
         current_connection.set(None)
@@ -294,6 +406,12 @@ class ActiveConnection:
         if isinstance(err, Unauthorized):
             code = const.ERR_UNAUTHORIZED
             err_message = "Unauthorized"
+        elif isinstance(err, SubscriptionQuotaExceeded):
+            # Rejecting an over-quota subscription is expected behavior, not
+            # an error, so it is not logged above debug level.
+            code = const.ERR_SUBSCRIPTION_QUOTA_EXCEEDED
+            err_message = str(err)
+            log_handler = self.logger.debug
         elif isinstance(err, probatio.Invalid):
             code = const.ERR_INVALID_FORMAT
             err_message = humanize_error(msg, err)
