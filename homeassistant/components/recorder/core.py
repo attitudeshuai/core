@@ -78,6 +78,13 @@ from .db_schema import (
 from .executor import DBInterruptibleThreadPoolExecutor
 from .models import DatabaseEngine, StatisticData, StatisticMetaData, UnsupportedDialect
 from .pool import POOL_SIZE, MutexPool, RecorderPool
+from .retention import (
+    PurgePlan,
+    PurgeProgress,
+    RetentionConfig,
+    build_purge_plan,
+    progress_for_plan,
+)
 from .table_managers.event_data import EventDataManager
 from .table_managers.event_types import EventTypeManager
 from .table_managers.recorder_runs import RecorderRunsManager
@@ -160,6 +167,7 @@ class Recorder(threading.Thread):
         db_retry_wait: int,
         entity_filter: Callable[[str], bool] | None,
         exclude_event_types: set[EventType[Any] | str],
+        retention_config: RetentionConfig | None = None,
     ) -> None:
         """Initialize the recorder."""
         threading.Thread.__init__(self, name="Recorder")
@@ -170,6 +178,7 @@ class Recorder(threading.Thread):
         self.auto_purge = auto_purge
         self.auto_repack = auto_repack
         self.keep_days = keep_days
+        self.retention_config = retention_config
         self.is_running: bool = False
         self._hass_started: asyncio.Future[object] = hass.loop.create_future()
         self.commit_interval = commit_interval
@@ -216,6 +225,12 @@ class Recorder(threading.Thread):
         self.use_legacy_events_index = False
         self._database_lock_task: DatabaseLockTask | None = None
         self._db_executor: DBInterruptibleThreadPoolExecutor | None = None
+
+        # Layered purge run state, accessed from the recorder thread and
+        # read from the event loop thread for progress reporting.
+        self._active_purge_run_id: str | None = None
+        self.purge_progress: PurgeProgress | None = None
+        self._purge_run_lock = threading.Lock()
 
         self._event_listener: CALLBACK_TYPE | None = None
         self._queue_watcher: CALLBACK_TYPE | None = None
@@ -499,6 +514,49 @@ class Recorder(threading.Thread):
         self._async_setup_periodic_tasks()
         self.async_recorder_ready.set()
 
+    def purge_run_begin(self, plan: PurgePlan | None) -> bool:
+        """Start or continue a purge run on the recorder thread.
+
+        Returns False if another purge run is active, in which case the
+        caller must reschedule the task instead of running it.
+        """
+        with self._purge_run_lock:
+            active = self._active_purge_run_id
+            if plan is None:
+                return active is None
+            if active is None:
+                self._active_purge_run_id = plan.run_id
+                # The progress is reset when a new run starts
+                self.purge_progress = progress_for_plan(plan)
+                return True
+            return active == plan.run_id
+
+    def purge_run_completed(self, plan: PurgePlan) -> None:
+        """Mark a layered purge run as no longer active."""
+        with self._purge_run_lock:
+            if self._active_purge_run_id == plan.run_id:
+                self._active_purge_run_id = None
+                if self.purge_progress is not None and self.purge_progress.running:
+                    # The run did not finalize itself, e.g. it failed
+                    self.purge_progress.finish(dt_util.utcnow())
+
+    @callback
+    def async_get_purge_progress(self) -> dict[str, Any] | None:
+        """Return a snapshot of the current purge progress.
+
+        This is a read-only query, it never queues or triggers a purge.
+        """
+        with self._purge_run_lock:
+            progress = self.purge_progress
+            return progress.as_dict() if progress is not None else None
+
+    @callback
+    def async_get_retention_config(self) -> dict[str, Any] | None:
+        """Return a snapshot of the layered retention configuration."""
+        if self.retention_config is None:
+            return None
+        return self.retention_config.as_dict()
+
     @callback
     def async_nightly_tasks(self, now: datetime) -> None:
         """Trigger the purge."""
@@ -508,7 +566,19 @@ class Recorder(threading.Thread):
             # until after the database is vacuumed
             repack = self.auto_repack and is_second_sunday(now)
             purge_before = dt_util.utcnow() - timedelta(days=self.keep_days)
-            self.queue_task(PurgeTask(purge_before, repack=repack, apply_filter=False))
+            plan = None
+            if self.retention_config is not None:
+                plan = build_purge_plan(
+                    self.hass,
+                    self.retention_config,
+                    purge_before,
+                    repack,
+                    apply_filter=False,
+                    now=dt_util.utcnow(),
+                )
+            self.queue_task(
+                PurgeTask(purge_before, repack=repack, apply_filter=False, plan=plan)
+            )
         else:
             self.queue_task(PerodicCleanupTask())
 

@@ -16,6 +16,7 @@ from homeassistant.util.event_type import EventType
 from . import entity_registry, purge, statistics
 from .db_schema import Statistics, StatisticsShortTerm
 from .models import StatisticData, StatisticMetaData
+from .retention import PurgePlan
 from .util import periodic_db_cleanups, session_scope
 
 _LOGGER = logging.getLogger(__name__)
@@ -118,13 +119,35 @@ class PurgeTask(RecorderTask):
     purge_before: datetime
     repack: bool
     apply_filter: bool
+    plan: PurgePlan | None = None
 
     @override
     def run(self, instance: Recorder) -> None:
         """Purge the database."""
-        if purge.purge_old_data(
-            instance, self.purge_before, self.repack, self.apply_filter
-        ):
+        plan = self.plan
+        # Purges are serialized: if another purge run is active, wait for
+        # it by rescheduling ourselves instead of interleaving.
+        if not instance.purge_run_begin(plan):
+            _LOGGER.debug("Purge waiting for the active purge run to finish")
+            instance.queue_task(
+                PurgeTask(self.purge_before, self.repack, self.apply_filter, plan)
+            )
+            return
+        try:
+            finished = purge.purge_old_data(
+                instance,
+                self.purge_before,
+                self.repack,
+                self.apply_filter,
+                plan=plan,
+            )
+        except Exception:
+            if plan is not None:
+                instance.purge_run_completed(plan)
+            raise
+        if finished:
+            if plan is not None:
+                instance.purge_run_completed(plan)
             # We always need to do the db cleanups after a purge
             # is finished to ensure the WAL checkpoint and other
             # tasks happen after a vacuum.
@@ -132,7 +155,7 @@ class PurgeTask(RecorderTask):
             return
         # Schedule a new purge task if this one didn't finish
         instance.queue_task(
-            PurgeTask(self.purge_before, self.repack, self.apply_filter)
+            PurgeTask(self.purge_before, self.repack, self.apply_filter, plan)
         )
 
 

@@ -291,6 +291,29 @@ def find_states_to_purge(
     )
 
 
+def find_states_to_purge_for_metadata(
+    metadata_ids: Iterable[int], purge_before: float, max_bind_vars: int
+) -> StatementLambdaElement:
+    """Find states to purge for a set of states_meta metadata ids."""
+    return lambda_stmt(
+        lambda: (
+            select(States.state_id, States.attributes_id)
+            .filter(States.metadata_id.in_(metadata_ids))
+            .filter(States.last_updated_ts < purge_before)
+            .limit(max_bind_vars)
+        )
+    )
+
+
+def count_states_by_metadata_id() -> StatementLambdaElement:
+    """Count remaining states grouped by states_meta metadata id."""
+    return lambda_stmt(
+        lambda: select(States.metadata_id, func.count(States.state_id)).group_by(
+            States.metadata_id
+        )
+    )
+
+
 def find_oldest_state() -> StatementLambdaElement:
     """Find the last_updated_ts of the oldest state."""
     return lambda_stmt(

@@ -44,6 +44,20 @@ from .const import (  # noqa: F401
 )
 from .core import Recorder
 from .entity_options import is_entity_recorded  # noqa: F401
+from .retention import (
+    CONF_ENTITY_DOMAINS,
+    CONF_ENTITY_ID_PREFIXES,
+    CONF_ENTITY_IDS,
+    CONF_INTEGRATION_DOMAINS,
+    CONF_KEEP_DAYS as CONF_RETENTION_KEEP_DAYS,
+    CONF_RETENTION,
+    CONF_RETENTION_DEFAULT_KEEP_DAYS,
+    CONF_RETENTION_ENABLED,
+    CONF_RETENTION_RULES,
+    CONF_RULE_NAME,
+    MAX_RETENTION_KEEP_DAYS,
+    config_from_yaml,
+)
 from .services import async_setup_services
 from .tasks import AddRecorderPlatformTask
 from .util import get_instance
@@ -79,6 +93,94 @@ EXCLUDE_SCHEMA = INCLUDE_EXCLUDE_FILTER_SCHEMA_INNER.extend(
 
 FILTER_SCHEMA = INCLUDE_EXCLUDE_BASE_FILTER_SCHEMA.extend(
     {probatio.Optional(CONF_EXCLUDE, default=EXCLUDE_SCHEMA({})): EXCLUDE_SCHEMA}
+)
+
+
+_RETENTION_KEEP_DAYS_SCHEMA = probatio.All(
+    probatio.Coerce(int), probatio.Range(min=0, max=MAX_RETENTION_KEEP_DAYS)
+)
+
+_RETENTION_RULE_CONDITION_KEYS = (
+    CONF_ENTITY_DOMAINS,
+    CONF_INTEGRATION_DOMAINS,
+    CONF_ENTITY_ID_PREFIXES,
+    CONF_ENTITY_IDS,
+)
+
+
+def _normalize_retention_rule(rule: dict) -> dict:
+    """Normalize a retention rule, lowercasing domain conditions."""
+    rule[CONF_ENTITY_DOMAINS] = sorted(
+        {domain.lower() for domain in rule[CONF_ENTITY_DOMAINS]}
+    )
+    rule[CONF_INTEGRATION_DOMAINS] = sorted(
+        {domain.lower() for domain in rule[CONF_INTEGRATION_DOMAINS]}
+    )
+    rule[CONF_ENTITY_ID_PREFIXES] = list(rule[CONF_ENTITY_ID_PREFIXES])
+    rule[CONF_ENTITY_IDS] = sorted(set(rule[CONF_ENTITY_IDS]))
+    return rule
+
+
+_RETENTION_RULE_SCHEMA = probatio.All(
+    probatio.Schema(
+        {
+            probatio.Optional(CONF_RULE_NAME): cv.string,
+            probatio.Required(CONF_RETENTION_KEEP_DAYS): _RETENTION_KEEP_DAYS_SCHEMA,
+            probatio.Optional(CONF_ENTITY_DOMAINS, default=list): probatio.All(
+                probatio.EnsureList(), [cv.string]
+            ),
+            probatio.Optional(CONF_INTEGRATION_DOMAINS, default=list): probatio.All(
+                probatio.EnsureList(), [cv.string]
+            ),
+            probatio.Optional(CONF_ENTITY_ID_PREFIXES, default=list): probatio.All(
+                probatio.EnsureList(), [cv.string]
+            ),
+            probatio.Optional(CONF_ENTITY_IDS, default=list): probatio.All(
+                probatio.EnsureList(), [cv.entity_id]
+            ),
+        }
+    ),
+    probatio.Any(
+        *(
+            probatio.Schema(
+                {probatio.Required(key): probatio.IsTrue()},
+                extra=probatio.ALLOW_EXTRA,
+            )
+            for key in _RETENTION_RULE_CONDITION_KEYS
+        ),
+        msg=(
+            "A retention rule must match entities using at least one of "
+            "'domains', 'integration_domains', 'entity_id_prefixes' or "
+            "'entity_ids'"
+        ),
+    ),
+    _normalize_retention_rule,
+)
+
+
+def _validate_retention_schema(conf: dict) -> dict:
+    """Validate the retention section once the whole section is parsed."""
+    if conf[CONF_RETENTION_ENABLED] and CONF_RETENTION_DEFAULT_KEEP_DAYS not in conf:
+        raise probatio.Invalid(
+            f"'{CONF_RETENTION_DEFAULT_KEEP_DAYS}' is required when "
+            f"'{CONF_RETENTION_ENABLED}' is true"
+        )
+    return conf
+
+
+RETENTION_SCHEMA = probatio.All(
+    probatio.Schema(
+        {
+            probatio.Optional(CONF_RETENTION_ENABLED, default=False): cv.boolean,
+            probatio.Optional(
+                CONF_RETENTION_DEFAULT_KEEP_DAYS
+            ): _RETENTION_KEEP_DAYS_SCHEMA,
+            probatio.Optional(CONF_RETENTION_RULES, default=list): [
+                _RETENTION_RULE_SCHEMA
+            ],
+        }
+    ),
+    _validate_retention_schema,
 )
 
 
@@ -125,6 +227,7 @@ CONFIG_SCHEMA = probatio.Schema(
                     probatio.Optional(
                         CONF_DB_INTEGRITY_CHECK, default=DEFAULT_DB_INTEGRITY_CHECK
                     ): cv.boolean,
+                    probatio.Optional(CONF_RETENTION): RETENTION_SCHEMA,
                 }
             ),
         )
@@ -152,6 +255,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     if EVENT_STATE_CHANGED in exclude_event_types:
         _LOGGER.error("State change events cannot be excluded, use a filter instead")
         exclude_event_types.remove(EVENT_STATE_CHANGED)
+    retention_config = config_from_yaml(conf.get(CONF_RETENTION))
     instance = hass.data[DATA_INSTANCE] = Recorder(
         hass=hass,
         auto_purge=auto_purge,
@@ -163,6 +267,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         db_retry_wait=db_retry_wait,
         entity_filter=entity_filter,
         exclude_event_types=exclude_event_types,
+        retention_config=retention_config,
     )
     get_instance.cache_clear()
     entity_registry.async_setup(hass)

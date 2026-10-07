@@ -6,8 +6,10 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
+from sqlalchemy import func, select
 from sqlalchemy.orm.session import Session
 
+from homeassistant.util import dt as dt_util
 from homeassistant.util.collection import chunked_or_all
 
 from .db_schema import Events, States, StatesMeta
@@ -15,6 +17,7 @@ from .models import DatabaseEngine
 from .queries import (
     attributes_ids_exist_in_states,
     attributes_ids_exist_in_states_with_fast_in_distinct,
+    count_states_by_metadata_id,
     data_ids_exist_in_events,
     data_ids_exist_in_events_with_fast_in_distinct,
     delete_event_data_rows,
@@ -27,6 +30,7 @@ from .queries import (
     delete_statistics_runs_rows,
     delete_statistics_short_term_rows,
     disconnect_states_rows,
+    find_all_states_metadata_ids,
     find_entity_ids_to_purge,
     find_event_types_to_purge,
     find_events_to_purge,
@@ -36,9 +40,11 @@ from .queries import (
     find_legacy_row,
     find_short_term_statistics_to_purge,
     find_states_to_purge,
+    find_states_to_purge_for_metadata,
     find_statistics_runs_to_purge,
 )
 from .repack import repack_database
+from .retention import PurgePlan, PurgeProgress
 from .util import retryable_database_job, session_scope
 
 if TYPE_CHECKING:
@@ -59,11 +65,44 @@ def purge_old_data(
     apply_filter: bool = False,
     events_batch_size: int = DEFAULT_EVENTS_BATCHES_PER_PURGE,
     states_batch_size: int = DEFAULT_STATES_BATCHES_PER_PURGE,
+    plan: PurgePlan | None = None,
 ) -> bool:
-    """Purge events and states older than purge_before.
+    """Purge events and states.
 
-    Cleans up an timeframe of an hour, based on the oldest record.
+    With a purge plan, states are purged per layer using the cutoff of the
+    first matching retention rule while events use the default layer
+    cutoff. Without a plan, every state and event older than purge_before is
+    purged, which is the historical single-cutoff behavior.
+
+    Cleans up a timeframe of an hour, based on the oldest record.
     """
+    if plan is None:
+        return _purge_old_data_single_cutoff(
+            instance,
+            purge_before,
+            repack,
+            apply_filter,
+            events_batch_size,
+            states_batch_size,
+        )
+    return _purge_old_data_layered(
+        instance,
+        plan,
+        apply_filter,
+        events_batch_size,
+        states_batch_size,
+    )
+
+
+def _purge_old_data_single_cutoff(
+    instance: Recorder,
+    purge_before: datetime,
+    repack: bool,
+    apply_filter: bool,
+    events_batch_size: int,
+    states_batch_size: int,
+) -> bool:
+    """Purge events and states older than purge_before."""
     _LOGGER.debug(
         "Purging states and events before target %s",
         purge_before.isoformat(sep=" ", timespec="seconds"),
@@ -129,6 +168,246 @@ def purge_old_data(
     if repack:
         repack_database(instance)
     return True
+
+
+def _purge_old_data_layered(
+    instance: Recorder,
+    plan: PurgePlan,
+    apply_filter: bool,
+    events_batch_size: int,
+    states_batch_size: int,
+) -> bool:
+    """Purge states per retention layer and events using the default cutoff.
+
+    Short term statistics, statistics runs and recorder runs keep using the
+    global purge_keep_days cutoff carried by the plan.
+    """
+    progress = instance.purge_progress
+    if progress is None or progress.run_id != plan.run_id:
+        _LOGGER.error(
+            "Layered purge %s started without matching progress tracking",
+            plan.run_id,
+        )
+        return True
+    _LOGGER.debug("Running layered purge %s", plan.run_id)
+    if instance.use_legacy_events_index:
+        # States still linked by event ids are migration leftovers, drain
+        # them with the global cutoff before layered purging takes over.
+        with session_scope(
+            session=instance.get_session(), read_only=True
+        ) as legacy_session:
+            legacy_rows_remaining = _purging_legacy_format(legacy_session)
+        if legacy_rows_remaining:
+            return _purge_old_data_single_cutoff(
+                instance,
+                plan.purge_before,
+                plan.repack,
+                apply_filter,
+                events_batch_size,
+                states_batch_size,
+            )
+
+    deleted_states_by_layer: dict[int, int] = {}
+    completed_layers: list[int] = []
+    deleted_events = 0
+    finished = True
+    with session_scope(session=instance.get_session()) as session:
+        groups = _resolve_layer_groups(instance, session, plan, progress)
+        default_layer_index = len(groups) - 1
+        states_batch_budget = states_batch_size
+        for index, metadata_ids in enumerate(groups):
+            layer_progress = progress.all_layers[index]
+            if layer_progress.processed:
+                continue
+            purge_before_ts = _layer_purge_before(plan, index).timestamp()
+            attributes_ids_batch: set[int] = set()
+            layer_states_done = True
+            while states_batch_budget and metadata_ids:
+                state_ids, attributes_ids = _select_layer_state_attributes_ids(
+                    session,
+                    metadata_ids,
+                    purge_before_ts,
+                    instance.max_bind_vars,
+                )
+                if not state_ids:
+                    break
+                deleted_states_by_layer[index] = deleted_states_by_layer.get(
+                    index, 0
+                ) + _purge_state_ids(instance, session, state_ids)
+                attributes_ids_batch |= attributes_ids
+                states_batch_budget -= 1
+                layer_states_done = False
+            _purge_unused_attributes_ids(instance, session, attributes_ids_batch)
+            if layer_states_done:
+                # The default layer also covers events and is only marked
+                # processed once the entire run finishes.
+                if index != default_layer_index:
+                    completed_layers.append(index)
+            else:
+                finished = False
+                break
+
+        events_has_more, deleted_events = _purge_layered_events_and_data_ids(
+            instance, session, events_batch_size, plan.default_layer.purge_before
+        )
+
+        statistics_runs, statistics_runs_has_more = _select_statistics_runs_to_purge(
+            session, plan.purge_before, instance.max_bind_vars
+        )
+        short_term_statistics, short_term_statistics_has_more = (
+            _select_short_term_statistics_to_purge(
+                session, plan.purge_before, instance.max_bind_vars
+            )
+        )
+        if statistics_runs:
+            _purge_statistics_runs(session, statistics_runs)
+
+        if short_term_statistics:
+            _purge_short_term_statistics(session, short_term_statistics)
+
+        if (
+            not finished
+            or events_has_more
+            or statistics_runs_has_more
+            or short_term_statistics_has_more
+        ):
+            _LOGGER.debug("Layered purge hasn't fully completed yet")
+            finished = False
+        elif apply_filter and not _purge_filtered_data(instance, session):
+            _LOGGER.debug("Cleanup filtered data hasn't fully completed yet")
+            finished = False
+        else:
+            # This purge cycle is finished, clean up old event types and
+            # recorder runs
+            _purge_old_event_types(instance, session)
+            _purge_old_entity_ids(instance, session)
+            _purge_old_recorder_runs(instance, session, plan.purge_before)
+
+    # The iteration has committed at this point, so the progress counters
+    # can safely be published.
+    progress.commit_iteration(deleted_states_by_layer, deleted_events, completed_layers)
+    if not finished:
+        return False
+
+    with session_scope(session=instance.get_session(), read_only=True) as read_session:
+        instance.recorder_runs_manager.load_from_db(read_session)
+        instance.states_manager.load_from_db(read_session)
+        retained_states, retained_events = _count_retained_records(read_session, plan)
+    progress.set_retained(retained_states, retained_events)
+    progress.finish(dt_util.utcnow())
+    if plan.repack:
+        repack_database(instance)
+    return True
+
+
+def _layer_purge_before(plan: PurgePlan, index: int) -> datetime:
+    """Return the cutoff of a layer, the default layer is last."""
+    if index < len(plan.layers):
+        return plan.layers[index].purge_before
+    return plan.default_layer.purge_before
+
+
+def _resolve_layer_groups(
+    instance: Recorder,
+    session: Session,
+    plan: PurgePlan,
+    progress: PurgeProgress,
+) -> list[set[int]]:
+    """Partition states_meta metadata ids into layer groups.
+
+    The partition is cached on the plan, so an interrupted run continues
+    using the same entities even if new entities appear while it is running.
+    """
+    if plan.metadata_groups is not None:
+        return plan.metadata_groups
+    groups: list[set[int]] = [set() for _ in range(len(plan.layers) + 1)]
+    matched = dict.fromkeys(range(len(groups)), 0)
+    for metadata_id, entity_id in session.execute(find_all_states_metadata_ids()).all():
+        index = plan.layer_for_entity(entity_id)
+        groups[index].add(metadata_id)
+        matched[index] += 1
+    plan.metadata_groups = groups
+    progress.set_matched_entities(matched)
+    return groups
+
+
+def _select_layer_state_attributes_ids(
+    session: Session,
+    metadata_ids: set[int],
+    purge_before_timestamp: float,
+    max_bind_vars: int,
+) -> tuple[set[int], set[int]]:
+    """Return sets of state and attribute ids to purge for a layer."""
+    state_ids: set[int] = set()
+    attributes_ids: set[int] = set()
+    for metadata_ids_chunk in chunked_or_all(metadata_ids, max_bind_vars):
+        for state_id, attributes_id in session.execute(
+            find_states_to_purge_for_metadata(
+                metadata_ids_chunk, purge_before_timestamp, max_bind_vars
+            )
+        ).all():
+            state_ids.add(state_id)
+            if attributes_id:
+                attributes_ids.add(attributes_id)
+    _LOGGER.debug(
+        "Selected %s layer state ids and %s attributes_ids to remove",
+        len(state_ids),
+        len(attributes_ids),
+    )
+    return state_ids, attributes_ids
+
+
+def _purge_layered_events_and_data_ids(
+    instance: Recorder,
+    session: Session,
+    events_batch_size: int,
+    purge_before: datetime,
+) -> tuple[bool, int]:
+    """Purge events older than the default layer cutoff in a batch.
+
+    Returns true if there are more events to purge and the number of
+    deleted event rows.
+    """
+    has_remaining_event_ids_to_purge = True
+    data_ids_batch: set[int] = set()
+    max_bind_vars = instance.max_bind_vars
+    deleted_events = 0
+    for _ in range(events_batch_size):
+        event_ids, data_ids = _select_event_data_ids_to_purge(
+            session, purge_before, max_bind_vars
+        )
+        if not event_ids:
+            has_remaining_event_ids_to_purge = False
+            break
+        deleted_events += _purge_event_ids(session, event_ids)
+        data_ids_batch = data_ids_batch | data_ids
+
+    _purge_unused_data_ids(instance, session, data_ids_batch)
+    _LOGGER.debug(
+        "After layered event purge remaining=%s", has_remaining_event_ids_to_purge
+    )
+    return has_remaining_event_ids_to_purge, deleted_events
+
+
+def _count_retained_records(
+    session: Session, plan: PurgePlan
+) -> tuple[dict[int, int], int]:
+    """Count the states retained per layer and the remaining events."""
+    groups = plan.metadata_groups
+    assert groups is not None
+    metadata_layer = {
+        metadata_id: index
+        for index, metadata_ids in enumerate(groups)
+        for metadata_id in metadata_ids
+    }
+    retained = dict.fromkeys(range(len(groups)), 0)
+    for metadata_id, count in session.execute(count_states_by_metadata_id()).all():
+        if (index := metadata_layer.get(metadata_id)) is not None:
+            retained[index] += count
+    retained_events = (
+        session.execute(select(func.count()).select_from(Events)).scalar() or 0
+    )
+    return retained, retained_events
 
 
 def _purging_legacy_format(session: Session) -> bool:
@@ -460,10 +739,10 @@ def _select_legacy_event_state_and_attributes_and_data_ids_to_purge(
     return event_ids, state_ids, attributes_ids, data_ids
 
 
-def _purge_state_ids(instance: Recorder, session: Session, state_ids: set[int]) -> None:
+def _purge_state_ids(instance: Recorder, session: Session, state_ids: set[int]) -> int:
     """Disconnect states and delete by state id."""
     if not state_ids:
-        return
+        return 0
 
     # Update old_state_id to NULL before deleting to ensure
     # the delete does not fail due to a foreign key constraint
@@ -472,11 +751,12 @@ def _purge_state_ids(instance: Recorder, session: Session, state_ids: set[int]) 
     disconnected_rows = session.execute(disconnect_states_rows(state_ids))
     _LOGGER.debug("Updated %s states to remove old_state_id", disconnected_rows)
 
-    deleted_rows = session.execute(delete_states_rows(state_ids))
-    _LOGGER.debug("Deleted %s states", deleted_rows)
+    result = session.connection().execute(delete_states_rows(state_ids))
+    _LOGGER.debug("Deleted %s states", result.rowcount)
 
     # Evict eny entries in the old_states cache referring to a purged state
     instance.states_manager.evict_purged_state_ids(state_ids)
+    return result.rowcount
 
 
 def _purge_batch_attributes_ids(
@@ -521,12 +801,13 @@ def _purge_short_term_statistics(
     _LOGGER.debug("Deleted %s short term statistics", deleted_rows)
 
 
-def _purge_event_ids(session: Session, event_ids: set[int]) -> None:
+def _purge_event_ids(session: Session, event_ids: set[int]) -> int:
     """Delete by event id."""
     if not event_ids:
-        return
-    deleted_rows = session.execute(delete_event_rows(event_ids))
-    _LOGGER.debug("Deleted %s events", deleted_rows)
+        return 0
+    result = session.connection().execute(delete_event_rows(event_ids))
+    _LOGGER.debug("Deleted %s events", result.rowcount)
+    return result.rowcount
 
 
 def _purge_old_recorder_runs(

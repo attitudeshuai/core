@@ -152,9 +152,44 @@ def async_setup(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_get_statistics_metadata)
     websocket_api.async_register_command(hass, ws_list_statistic_ids)
     websocket_api.async_register_command(hass, ws_import_statistics)
+    websocket_api.async_register_command(hass, ws_purge_progress)
+    websocket_api.async_register_command(hass, ws_retention_config)
     websocket_api.async_register_command(hass, ws_update_statistics_issues)
     websocket_api.async_register_command(hass, ws_update_statistics_metadata)
     websocket_api.async_register_command(hass, ws_validate_statistics)
+
+
+@websocket_api.websocket_command(
+    {
+        probatio.Required("type"): "recorder/purge_progress",
+    }
+)
+@callback
+def ws_purge_progress(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Return the progress of the current or most recent purge.
+
+    Read-only: this never starts or queues a purge.
+    """
+    connection.send_result(msg["id"], get_instance(hass).async_get_purge_progress())
+
+
+@websocket_api.websocket_command(
+    {
+        probatio.Required("type"): "recorder/retention_config",
+    }
+)
+@callback
+def ws_retention_config(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Return the layered retention configuration.
+
+    Read-only: this never starts or queues a purge. Returns null when
+    layered retention is disabled.
+    """
+    connection.send_result(msg["id"], get_instance(hass).async_get_retention_config())
 
 
 def _ws_get_statistic_during_period(
