@@ -27,7 +27,7 @@ from async_interrupt import interrupt
 import probatio
 from propcache.api import cached_property
 
-from . import data_entry_flow, loader
+from . import data_entry_flow, loader, setup_diagnostics
 from .const import (
     CONF_NAME,
     EVENT_HOMEASSISTANT_STARTED,
@@ -721,11 +721,13 @@ class ConfigEntry[_DataT = Any]:
         if self.source == SOURCE_IGNORE or self.disabled_by:
             return
 
+        flow_token = setup_diagnostics.async_begin_load_flow(hass)
         current_entry.set(self)
         try:
             await self.__async_setup_with_context(hass, integration)
         finally:
             current_entry.set(None)
+            setup_diagnostics.async_end_load_flow(flow_token)
 
     @callback
     def __async_handle_config_entry_setup_error(
@@ -766,6 +768,15 @@ class ConfigEntry[_DataT = Any]:
                 self.domain,
                 reason.reason,
             )
+            setup_diagnostics.async_notify_entry_setup_failure(
+                hass,
+                self,
+                (
+                    setup_diagnostics.SetupFailureKind.CONFIG_ENTRY_MIGRATION_ERROR
+                    if migration
+                    else setup_diagnostics.SetupFailureKind.CONFIG_ENTRY_SETUP_ERROR
+                ),
+            )
 
         elif isinstance(exc, ConfigEntryAuthFailed):
             message = str(exc)
@@ -789,6 +800,9 @@ class ConfigEntry[_DataT = Any]:
             if not migration:
                 # Reauth flows assume post-migration config entry state
                 self.async_start_reauth_if_available(hass)
+            setup_diagnostics.async_notify_entry_setup_failure(
+                hass, self, setup_diagnostics.SetupFailureKind.CONFIG_ENTRY_AUTH_FAILED
+            )
 
         elif isinstance(exc, ConfigEntryNotReady):
             reason = _SetupErrorReason(
@@ -839,6 +853,9 @@ class ConfigEntry[_DataT = Any]:
                     EVENT_HOMEASSISTANT_STARTED,
                     functools.partial(self._async_setup_again, hass),
                 )
+            setup_diagnostics.async_notify_retry_scheduled(
+                hass, self, wait_time, hass.state is CoreState.running
+            )
 
         elif isinstance(exc, asyncio.CancelledError):
             # We want to propagate CancelledError if we are being cancelled.
@@ -868,6 +885,15 @@ class ConfigEntry[_DataT = Any]:
                 self.title,
                 integration.domain,
             )
+            setup_diagnostics.async_notify_entry_setup_failure(
+                hass,
+                self,
+                (
+                    setup_diagnostics.SetupFailureKind.CONFIG_ENTRY_MIGRATION_ERROR
+                    if migration
+                    else setup_diagnostics.SetupFailureKind.CONFIG_ENTRY_SETUP_ERROR
+                ),
+            )
 
         else:
             logger.exception(
@@ -876,6 +902,15 @@ class ConfigEntry[_DataT = Any]:
                 else "Error setting up entry %s for %s",
                 self.title,
                 integration.domain,
+            )
+            setup_diagnostics.async_notify_entry_setup_failure(
+                hass,
+                self,
+                (
+                    setup_diagnostics.SetupFailureKind.CONFIG_ENTRY_MIGRATION_ERROR
+                    if migration
+                    else setup_diagnostics.SetupFailureKind.CONFIG_ENTRY_SETUP_ERROR
+                ),
             )
         return (reason, retry_later)
 
@@ -928,6 +963,11 @@ class ConfigEntry[_DataT = Any]:
                 err,
             )
             if domain_is_integration:
+                setup_diagnostics.async_notify_entry_setup_failure(
+                    hass,
+                    self,
+                    setup_diagnostics.SetupFailureKind.CONFIG_ENTRY_IMPORT_ERROR,
+                )
                 self._async_set_state(
                     hass, ConfigEntryState.SETUP_ERROR, "Import error"
                 )
@@ -936,6 +976,7 @@ class ConfigEntry[_DataT = Any]:
         reason = _SetupErrorReason()
 
         result = False
+        failure_recorded = False
 
         if domain_is_integration:
             try:
@@ -950,12 +991,18 @@ class ConfigEntry[_DataT = Any]:
                     self.domain,
                     err,
                 )
+                setup_diagnostics.async_notify_entry_setup_failure(
+                    hass,
+                    self,
+                    setup_diagnostics.SetupFailureKind.CONFIG_ENTRY_IMPORT_ERROR,
+                )
                 self._async_set_state(
                     hass, ConfigEntryState.SETUP_ERROR, "Import error"
                 )
                 return
 
             # Perform migration
+            migration_failure_recorded = False
             try:
                 migration_result = await self.async_migrate(hass)
             except (
@@ -969,8 +1016,15 @@ class ConfigEntry[_DataT = Any]:
                 if retry_later:
                     return
                 migration_result = False
+                migration_failure_recorded = True
 
             if not migration_result:
+                if not migration_failure_recorded:
+                    setup_diagnostics.async_notify_entry_setup_failure(
+                        hass,
+                        self,
+                        setup_diagnostics.SetupFailureKind.CONFIG_ENTRY_MIGRATION_ERROR,
+                    )
                 self._async_set_state(hass, ConfigEntryState.MIGRATION_ERROR, *reason)
                 return
 
@@ -999,6 +1053,7 @@ class ConfigEntry[_DataT = Any]:
             )
             if retry_later:
                 return
+            failure_recorded = True
 
         finally:
             if not result and domain_is_integration:
@@ -1018,11 +1073,17 @@ class ConfigEntry[_DataT = Any]:
         if not domain_is_integration:
             return
 
-        self.async_cancel_retry_setup()
+        self.async_cancel_retry_setup(hass)
 
         if result:
             self._async_set_state(hass, ConfigEntryState.LOADED, None)
         else:
+            if not failure_recorded:
+                setup_diagnostics.async_notify_entry_setup_failure(
+                    hass,
+                    self,
+                    setup_diagnostics.SetupFailureKind.CONFIG_ENTRY_SETUP_ERROR,
+                )
             self._async_set_state(hass, ConfigEntryState.SETUP_ERROR, *reason)
 
     @callback
@@ -1033,6 +1094,7 @@ class ConfigEntry[_DataT = Any]:
         is unset as soon as its callback is called.
         """
         self._async_cancel_retry_setup = None
+        setup_diagnostics.async_notify_retry_fired(hass, self)
         # Check again when we fire in case shutdown
         # has started so we do not block shutdown
         if not hass.is_stopping:
@@ -1061,14 +1123,16 @@ class ConfigEntry[_DataT = Any]:
             await self.async_setup(hass, integration=integration)
 
     @callback
-    def async_shutdown(self) -> None:
+    def async_shutdown(self, hass: HomeAssistant) -> None:
         """Call when Home Assistant is stopping."""
-        self.async_cancel_retry_setup()
+        self.async_cancel_retry_setup(hass)
 
     @callback
-    def async_cancel_retry_setup(self) -> None:
+    def async_cancel_retry_setup(self, hass: HomeAssistant | None = None) -> None:
         """Cancel retry setup."""
         if self._async_cancel_retry_setup is not None:
+            if hass is not None:
+                setup_diagnostics.async_notify_retry_cancelled(hass, self)
             self._async_cancel_retry_setup()
             self._async_cancel_retry_setup = None
 
@@ -1111,7 +1175,7 @@ class ConfigEntry[_DataT = Any]:
                 return False
 
             if self.state is not ConfigEntryState.LOADED:
-                self.async_cancel_retry_setup()
+                self.async_cancel_retry_setup(hass)
                 self._async_set_state(hass, ConfigEntryState.NOT_LOADED, None)
                 return True
 
@@ -2406,7 +2470,7 @@ class ConfigEntries:
     def _async_shutdown(self, event: Event) -> None:
         """Call when Home Assistant is stopping."""
         for entry in self._entries.values():
-            entry.async_shutdown()
+            entry.async_shutdown(self.hass)
         self.flow.async_shutdown()
 
     async def async_initialize(self) -> None:
@@ -2612,7 +2676,7 @@ class ConfigEntries:
     def async_schedule_reload(self, entry_id: str) -> None:
         """Schedule a config entry to be reloaded."""
         entry = self.async_get_known_entry(entry_id)
-        entry.async_cancel_retry_setup()
+        entry.async_cancel_retry_setup(self.hass)
         self.hass.async_create_task(
             self.async_reload(entry_id),
             f"config entry reload {entry.title} {entry.domain} {entry.entry_id}",
@@ -2634,7 +2698,7 @@ class ConfigEntries:
         # Cancel the setup retry task before waiting for the
         # reload lock to reduce the chance of concurrent reload
         # attempts.
-        entry.async_cancel_retry_setup()
+        entry.async_cancel_retry_setup(self.hass)
 
         # Abort any in-progress reauth flow and linked issues
         _abort_reauth_flows(self.hass, entry.domain, entry_id)

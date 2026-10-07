@@ -14,7 +14,7 @@ import platform
 import sys
 import threading
 from time import monotonic
-from typing import TYPE_CHECKING, Any, override
+from typing import TYPE_CHECKING, Any, Final, override
 
 # Import cryptography early since import openssl is not thread-safe
 # _frozen_importlib._DeadlockError: deadlock detected by
@@ -30,6 +30,7 @@ from . import (
     core,
     loader,
     requirements,
+    setup_diagnostics,
 )
 
 # Pre-import frontend deps which have no requirements here to avoid
@@ -150,6 +151,8 @@ COOLDOWN_TIME = 60
 
 # Core integrations are unconditionally loaded
 CORE_INTEGRATIONS = {"homeassistant", "persistent_notification"}
+
+_DIAGNOSTICS_CONFIG_UNSET: Final = object()
 
 # Integrations that are loaded right after the core is set up
 LOGGING_AND_HTTP_DEPS_INTEGRATIONS = {
@@ -562,6 +565,28 @@ async def async_from_config_dict(
             "Home Assistant core failed to initialize. Further initialization aborted"
         )
         return None
+
+    diagnostics_config = config.pop(setup_diagnostics.DOMAIN, _DIAGNOSTICS_CONFIG_UNSET)
+    if diagnostics_config is not _DIAGNOSTICS_CONFIG_UNSET:
+        try:
+            diagnostics_config = await hass.async_add_executor_job(
+                setup_diagnostics.SETUP_DIAGNOSTICS_CONFIG_SCHEMA,
+                diagnostics_config,
+            )
+        except probatio.Invalid as config_err:
+            conf_util.async_log_schema_error(
+                config_err,
+                setup_diagnostics.DOMAIN,
+                diagnostics_config,
+                hass,
+            )
+            async_notify_setup_error(hass, setup_diagnostics.DOMAIN)
+            return None
+        if (
+            diagnostics_config[setup_diagnostics.CONF_STATE]
+            is setup_diagnostics.SetupDiagnosticsState.ON
+        ):
+            setup_diagnostics.async_enable(hass, diagnostics_config)
 
     await _async_set_up_integrations(hass, config)
 

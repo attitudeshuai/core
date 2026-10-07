@@ -12,7 +12,7 @@ import time
 from types import ModuleType
 from typing import Any, Final, TypedDict
 
-from . import config as conf_util, core, loader, requirements
+from . import config as conf_util, core, loader, requirements, setup_diagnostics
 from .const import (
     BASE_PLATFORMS,  # noqa: F401
     EVENT_COMPONENT_LOADED,
@@ -163,6 +163,7 @@ async def async_setup_component(
 
     setup_future = hass.loop.create_future()
     setup_futures[domain] = setup_future
+    flow_token = setup_diagnostics.async_begin_load_flow(hass)
 
     try:
         result = await _async_setup_component(hass, domain, config)
@@ -183,10 +184,12 @@ async def async_setup_component(
             future.set_exception(err)
             with contextlib.suppress(BaseException):
                 # Clear the flag as its normal that nothing
-                # will wait for this future to be resolved
-                # if there are no concurrent setup attempts
+                # will wait for this future if there are no concurrent
+                # setup attempts
                 await future
         raise
+    finally:
+        setup_diagnostics.async_end_load_flow(flow_token)
     return result
 
 
@@ -255,6 +258,39 @@ async def _async_process_dependencies(
     return failed
 
 
+@core.callback
+def _notify_deps_reqs_failure(
+    hass: core.HomeAssistant, domain: str, err: HomeAssistantError
+) -> None:
+    """Classify and notify a failure while processing deps or requirements."""
+    if isinstance(err, DependencyError):
+        setup_diagnostics.async_notify_setup_failure(
+            hass,
+            domain,
+            setup_diagnostics.SetupFailureKind.DEPENDENCY_SETUP_FAILED,
+            dependency_failure=True,
+            related_domains=tuple(err.failed_dependencies),
+        )
+        return
+    if isinstance(err, requirements.RequirementsNotFound):
+        caused_by_dependency = err.domain != domain
+        setup_diagnostics.async_notify_setup_failure(
+            hass,
+            domain,
+            setup_diagnostics.SetupFailureKind.REQUIREMENTS_NOT_FOUND,
+            dependency_failure=caused_by_dependency,
+            related_domains=(err.domain,) if caused_by_dependency else (),
+            requirements=tuple(err.requirements),
+        )
+        return
+    setup_diagnostics.async_notify_setup_failure(
+        hass,
+        domain,
+        setup_diagnostics.SetupFailureKind.SETUP_ERROR,
+        dependency_failure=False,
+    )
+
+
 def _log_error_setup_error(
     hass: HomeAssistant,
     domain: str,
@@ -283,6 +319,12 @@ async def _async_setup_component(
     try:
         integration = await loader.async_get_integration(hass, domain)
     except loader.IntegrationNotFound:
+        setup_diagnostics.async_notify_setup_failure(
+            hass,
+            domain,
+            setup_diagnostics.SetupFailureKind.INTEGRATION_NOT_FOUND,
+            dependency_failure=False,
+        )
         _log_error_setup_error(hass, domain, None, "Integration not found.")
         if not hass.config.safe_mode and hass.config_entries.async_entries(domain):
             ir.async_create_issue(
@@ -303,6 +345,12 @@ async def _async_setup_component(
     log_error = partial(_log_error_setup_error, hass, domain, integration)
 
     if integration.disabled:
+        setup_diagnostics.async_notify_setup_failure(
+            hass,
+            domain,
+            setup_diagnostics.SetupFailureKind.INTEGRATION_DISABLED,
+            dependency_failure=False,
+        )
         log_error(f"Dependency is disabled - {integration.disabled}")
         return False
 
@@ -321,6 +369,7 @@ async def _async_setup_component(
         )
     # Validate all dependencies exist and there are no circular dependencies
     if await integration.resolve_dependencies() is None:
+        setup_diagnostics.async_notify_unresolved_dependencies(hass, integration)
         return False
 
     # Process requirements as soon as possible, so we can import the component
@@ -328,6 +377,7 @@ async def _async_setup_component(
     try:
         await async_process_deps_reqs(hass, config, integration)
     except HomeAssistantError as err:
+        _notify_deps_reqs_failure(hass, domain, err)
         log_error(str(err))
         return False
 
@@ -336,6 +386,12 @@ async def _async_setup_component(
     try:
         component = await integration.async_get_component()
     except ImportError as err:
+        setup_diagnostics.async_notify_setup_failure(
+            hass,
+            domain,
+            setup_diagnostics.SetupFailureKind.IMPORT_ERROR,
+            dependency_failure=False,
+        )
         log_error(f"Unable to import component: {err}", err)
         return False
 
@@ -353,6 +409,12 @@ async def _async_setup_component(
             hass, platform_exception.platform_path, platform_exception.integration_link
         )
     if processed_config is None:
+        setup_diagnostics.async_notify_setup_failure(
+            hass,
+            domain,
+            setup_diagnostics.SetupFailureKind.INVALID_CONFIG,
+            dependency_failure=False,
+        )
         log_error("Invalid config.")
         return False
 
@@ -413,6 +475,12 @@ async def _async_setup_component(
                     None, component.setup, hass, processed_config
                 )
             elif not hasattr(component, "async_setup_entry"):
+                setup_diagnostics.async_notify_setup_failure(
+                    hass,
+                    domain,
+                    setup_diagnostics.SetupFailureKind.SETUP_ERROR,
+                    dependency_failure=False,
+                )
                 log_error("No setup or config entry setup function defined.")
                 return False
 
@@ -420,6 +488,12 @@ async def _async_setup_component(
                 async with hass.timeout.async_timeout(SLOW_SETUP_MAX_WAIT, domain):
                     result = await task
         except TimeoutError:
+            setup_diagnostics.async_notify_setup_failure(
+                hass,
+                domain,
+                setup_diagnostics.SetupFailureKind.SETUP_ERROR,
+                dependency_failure=False,
+            )
             _LOGGER.error(
                 (
                     "Setup of '%s' is taking longer than %s seconds."
@@ -431,6 +505,12 @@ async def _async_setup_component(
             return False
         # pylint: disable-next=broad-except
         except (asyncio.CancelledError, SystemExit, Exception) as exc:
+            setup_diagnostics.async_notify_setup_failure(
+                hass,
+                domain,
+                setup_diagnostics.SetupFailureKind.SETUP_ERROR,
+                dependency_failure=False,
+            )
             _LOGGER.exception("Error during setup of component %s: %s", domain, exc)  # noqa: TRY401
             async_notify_setup_error(hass, domain, integration.documentation)
             return False
@@ -438,9 +518,21 @@ async def _async_setup_component(
             if warn_task:
                 warn_task.cancel()
         if result is False:
+            setup_diagnostics.async_notify_setup_failure(
+                hass,
+                domain,
+                setup_diagnostics.SetupFailureKind.SETUP_ERROR,
+                dependency_failure=False,
+            )
             log_error("Integration failed to initialize.")
             return False
         if result is not True:
+            setup_diagnostics.async_notify_setup_failure(
+                hass,
+                domain,
+                setup_diagnostics.SetupFailureKind.SETUP_ERROR,
+                dependency_failure=False,
+            )
             log_error(
                 f"Integration {domain!r} did not return boolean if setup was "
                 "successful. Disabling component."
@@ -483,6 +575,8 @@ async def _async_setup_component(
     hass.bus.async_fire_internal(
         EVENT_COMPONENT_LOADED, EventComponentLoaded(component=domain)
     )
+
+    setup_diagnostics.async_notify_setup_success(hass, domain)
 
     return True
 

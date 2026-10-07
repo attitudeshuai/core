@@ -28,9 +28,15 @@ from homeassistant.requirements import (
     async_clear_install_history,
     async_get_integration_with_requirements,
 )
+from homeassistant.setup_diagnostics import (
+    DOMAIN as SETUP_DIAGNOSTICS_DOMAIN,
+    SETUP_DIAGNOSTICS_CONFIG_SCHEMA,
+)
 
 from . import condition, config_validation as cv, trigger
 from .typing import ConfigType
+
+_UNSET = object()
 
 
 class CheckConfigError(NamedTuple):
@@ -181,6 +187,22 @@ async def async_check_ha_config_file(  # noqa: C901
         )
         core_config = {}
     core_config.pop(CONF_PACKAGES, None)
+
+    # Extract and validate the [setup_diagnostics] config. The section is
+    # consumed by bootstrap directly and is not an integration, so it is
+    # not added to the check result.
+    setup_diagnostics_config = config.pop(SETUP_DIAGNOSTICS_DOMAIN, _UNSET)
+    if setup_diagnostics_config is not _UNSET:
+        try:
+            SETUP_DIAGNOSTICS_CONFIG_SCHEMA(setup_diagnostics_config)
+        except probatio.Invalid as err:
+            result.add_error(
+                format_schema_error(
+                    hass, err, SETUP_DIAGNOSTICS_DOMAIN, setup_diagnostics_config
+                ),
+                SETUP_DIAGNOSTICS_DOMAIN,
+                setup_diagnostics_config,
+            )
 
     # Filter out repeating config sections
     components = {cv.domain_key(key) for key in config}

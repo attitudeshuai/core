@@ -9,6 +9,7 @@ from typing import Any, cast
 
 import probatio
 
+from homeassistant import setup_diagnostics
 from homeassistant.auth.models import User
 from homeassistant.auth.permissions.const import POLICY_READ
 from homeassistant.auth.permissions.events import SUBSCRIBE_ALLOWLIST
@@ -128,6 +129,9 @@ def async_register_commands(
     async_reg(hass, handle_manifest_list)
     async_reg(hass, handle_ping)
     async_reg(hass, handle_render_template)
+    async_reg(hass, handle_setup_diagnostics_events)
+    async_reg(hass, handle_setup_diagnostics_health)
+    async_reg(hass, handle_setup_diagnostics_impact)
     async_reg(hass, handle_slugify)
     async_reg(hass, handle_subscribe_bootstrap_integrations)
     async_reg(hass, handle_subscribe_condition)
@@ -740,6 +744,82 @@ async def handle_manifest_get(
         connection.send_error(msg["id"], const.ERR_NOT_FOUND, "Integration not found")
     else:
         connection.send_result(msg["id"], integration.manifest_json_fragment)
+
+
+@callback
+@decorators.require_admin
+@decorators.websocket_command(
+    {
+        probatio.Required("type"): "setup_diagnostics/health",
+        probatio.Optional("domains"): [str],
+    }
+)
+def handle_setup_diagnostics_health(
+    hass: HomeAssistant, connection: ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Handle setup diagnostics health command."""
+    try:
+        readings = setup_diagnostics.async_get_setup_health(hass, msg.get("domains"))
+    except setup_diagnostics.SetupDiagnosticsNotEnabled:
+        connection.send_error(
+            msg["id"], const.ERR_NOT_SUPPORTED, "Setup diagnostics is not enabled"
+        )
+        return
+    connection.send_result(
+        msg["id"],
+        [
+            setup_diagnostics.health_to_dict(readings[domain])
+            for domain in sorted(readings)
+        ],
+    )
+
+
+@decorators.require_admin
+@decorators.websocket_command(
+    {
+        probatio.Required("type"): "setup_diagnostics/impact",
+        probatio.Required("domain"): str,
+    }
+)
+@decorators.async_response
+async def handle_setup_diagnostics_impact(
+    hass: HomeAssistant, connection: ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Handle setup diagnostics dependency impact command."""
+    try:
+        impact = await setup_diagnostics.async_get_dependency_impact(
+            hass, msg["domain"]
+        )
+    except setup_diagnostics.SetupDiagnosticsNotEnabled:
+        connection.send_error(
+            msg["id"], const.ERR_NOT_SUPPORTED, "Setup diagnostics is not enabled"
+        )
+        return
+    connection.send_result(msg["id"], setup_diagnostics.impact_to_dict(impact))
+
+
+@callback
+@decorators.require_admin
+@decorators.websocket_command(
+    {
+        probatio.Required("type"): "setup_diagnostics/events",
+        probatio.Optional("domains"): [str],
+    }
+)
+def handle_setup_diagnostics_events(
+    hass: HomeAssistant, connection: ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Handle setup diagnostics events command."""
+    try:
+        events = setup_diagnostics.async_get_diagnostic_events(hass, msg.get("domains"))
+    except setup_diagnostics.SetupDiagnosticsNotEnabled:
+        connection.send_error(
+            msg["id"], const.ERR_NOT_SUPPORTED, "Setup diagnostics is not enabled"
+        )
+        return
+    connection.send_result(
+        msg["id"], [setup_diagnostics.event_to_dict(event) for event in events]
+    )
 
 
 @callback

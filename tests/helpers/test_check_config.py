@@ -93,6 +93,32 @@ async def test_bad_core_config(hass: HomeAssistant) -> None:
         _assert_warnings_errors(res, [], [error])
 
 
+async def test_setup_diagnostics_section_valid(hass: HomeAssistant) -> None:
+    """Test a valid setup_diagnostics section is consumed without errors."""
+    files = {YAML_CONFIG_FILE: BASE_CONFIG + "setup_diagnostics:\n  state: on\n"}
+    with patch("os.path.isfile", return_value=True), patch_yaml_files(files):
+        res = await async_check_ha_config_file(hass)
+        log_ha_config(res)
+
+        # The section is consumed by bootstrap and is not an integration
+        assert res.keys() == {"homeassistant"}
+        _assert_warnings_errors(res, [], [])
+
+
+async def test_setup_diagnostics_section_invalid(hass: HomeAssistant) -> None:
+    """Test an invalid setup_diagnostics section reports an error."""
+    files = {
+        YAML_CONFIG_FILE: BASE_CONFIG
+        + "setup_diagnostics:\n  sample_rate: 2\n  state: on\n"
+    }
+    with patch("os.path.isfile", return_value=True), patch_yaml_files(files):
+        res = await async_check_ha_config_file(hass)
+        log_ha_config(res)
+
+        assert len(res.errors) == 1
+        assert res.errors[0].domain == "setup_diagnostics"
+
+
 async def test_config_platform_valid(hass: HomeAssistant) -> None:
     """Test a valid platform setup."""
     files = {YAML_CONFIG_FILE: BASE_CONFIG + "light:\n  platform: demo"}
